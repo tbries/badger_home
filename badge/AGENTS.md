@@ -137,7 +137,7 @@ screen.draw(shape)  # shape from shapes module
 screen.text("Hello", x, y)
 
 # Measure text size
-width = screen.measure_text("Hello")
+width, _ = screen.measure_text("Hello")
 
 # Blit (copy) image at position
 screen.blit(image, x, y)
