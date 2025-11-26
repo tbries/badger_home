@@ -1,6 +1,7 @@
 from badgeware import screen, io, brushes, shapes, run, PixelFont, file_exists
 import json
 import asyncio
+import random
 
 # Note: Bluetooth functionality requires aioble/bluetooth modules
 # which are only available on the badge hardware, not in dev environment
@@ -10,22 +11,19 @@ try:
     BLUETOOTH_AVAILABLE = True
 except ImportError:
     BLUETOOTH_AVAILABLE = False
-    print("Bluetooth not available - running in limited mode")
 
 # Bluetooth UUIDs - Custom service for text display
+_TEXT_SERVICE_UUID = None
+_TEXT_CHAR_UUID = None
+_ADV_INTERVAL_US = 250_000
+
+# GATT objects (initialized in init())
+text_service = None
+text_characteristic = None
+
 if BLUETOOTH_AVAILABLE:
     _TEXT_SERVICE_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef0")
     _TEXT_CHAR_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef1")
-    
-    # Advertising interval (250ms)
-    _ADV_INTERVAL_US = 250_000
-    
-    # GATT Server setup
-    text_service = aioble.Service(_TEXT_SERVICE_UUID)
-    text_characteristic = aioble.Characteristic(
-        text_service, _TEXT_CHAR_UUID, write=True, read=True, capture=True
-    )
-    aioble.register_services(text_service)
 
 # Save file path
 _SAVE_FILE = "/badge2_text.json"
@@ -33,10 +31,13 @@ _SAVE_FILE = "/badge2_text.json"
 # Global state
 state = {
     "text": "The quick brown fox jumps",
-    "connection_status": "Initializing...",
-    "advertising": None,
-    "connection": None,
-    "bt_phase": "idle"  # idle, advertising, connected
+    "status": "Initializing...",
+    "bt_phase": "idle",  # idle, advertising, connected
+    "password": "----",
+    "advertising": None,  # Temporary handle during advertising
+    "connection": None,   # Temporary handle during connection
+    "error_text": None,   # Temporary error message to display
+    "error_time": 0       # Time when error was shown
 }
 
 
@@ -47,8 +48,8 @@ def load_text():
             with open(_SAVE_FILE, "r") as f:
                 data = json.load(f)
                 return data.get("text", state["text"])
-    except Exception as e:
-        print(f"Error loading text: {e}")
+    except Exception:
+        pass
     return state["text"]
 
 
@@ -57,9 +58,14 @@ def save_text(text):
     try:
         with open(_SAVE_FILE, "w") as f:
             json.dump({"text": text}, f)
-        print(f"Saved text: {text}")
-    except Exception as e:
-        print(f"Error saving text: {e}")
+    except Exception:
+        pass
+
+
+def generate_password():
+    """Generate a random 4-character alphanumeric password."""
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return ''.join(random.choice(chars) for _ in range(4))
 
 
 def handle_bluetooth():
@@ -69,80 +75,111 @@ def handle_bluetooth():
     
     try:
         if state["bt_phase"] == "idle":
-            # Start advertising
-            state["connection_status"] = "Starting..."
-            print("Starting Bluetooth advertising")
-            state["advertising"] = aioble.advertise(
-                _ADV_INTERVAL_US,
-                name="badge2-text",
-                services=[_TEXT_SERVICE_UUID],
-            )
-            state["bt_phase"] = "advertising"
-            state["connection_status"] = "Advertising..."
-            print("Now advertising")
+            state["status"] = "Starting..."
+            try:
+                state["advertising"] = aioble.advertise(
+                    _ADV_INTERVAL_US,
+                    name="badge2-text",
+                    services=[_TEXT_SERVICE_UUID],
+                )
+                state["bt_phase"] = "advertising"
+                state["status"] = "Advertising..."
+            except Exception:
+                state["status"] = "Adv failed"
+                state["bt_phase"] = "error"
+                return
             
         elif state["bt_phase"] == "advertising":
-            # Check for incoming connection (this will block until connection)
-            state["connection_status"] = "Waiting for conn..."
-            print("Waiting for connection...")
-            
-            # This blocks, which is OK per requirements
-            connection = asyncio.run(state["advertising"])
-            
-            state["connection"] = connection
-            state["bt_phase"] = "connected"
-            state["connection_status"] = "Connected!"
-            print(f"Connected: {connection.device}")
+            state["status"] = "Waiting..."
+            try:
+                connection = asyncio.run(state["advertising"])
+                state["connection"] = connection
+                state["bt_phase"] = "connected"
+                state["status"] = "Connected!"
+            except Exception:
+                state["status"] = "Conn failed"
+                state["bt_phase"] = "idle"
+                state["advertising"] = None
+                return
             
         elif state["bt_phase"] == "connected":
-            # Listen for writes
             connection = state["connection"]
             
             if not connection.is_connected():
-                print("Disconnected")
-                state["connection_status"] = "Disconnected"
+                state["status"] = "Disconnected"
                 state["connection"] = None
                 state["advertising"] = None
                 state["bt_phase"] = "idle"
                 return
             
-            state["connection_status"] = "Listening..."
+            # Check if we have buffered data from previous fragments
+            if "write_buffer" in state and len(state["write_buffer"]) > 0:
+                state["status"] = f"Buffering ({len(state['write_buffer'])}b)..."
+            else:
+                state["status"] = "Listening..."
             
             try:
-                # Wait for write (blocks until write or timeout)
-                conn, data = asyncio.run(
+                # Wait for write event (returns connection only, not data)
+                conn = asyncio.run(
                     asyncio.wait_for(text_characteristic.written(), timeout=2.0)
                 )
                 
+                # Read the complete characteristic value (BLE stack handles reassembly)
+                data = text_characteristic.read()
+                
                 if data:
-                    # Decode and save new text
-                    new_text = data.decode('utf-8')
-                    print(f"Received: {new_text}")
-                    state["text"] = new_text
-                    save_text(new_text)
-                    state["connection_status"] = "Updated!"
+                    try:
+                        payload = json.loads(data.decode('utf-8'))
+                        password_key = "p"
+                        text_key = "t"
+                        
+                        # Validate payload structure and password
+                        if password_key not in payload or text_key not in payload:
+                            state["status"] = "Bad format"
+                            state["error_text"] = f"Missing fields: {list(payload.keys())}"
+                            state["error_time"] = io.ticks
+                            return
+                        
+                        if payload[password_key] != state["password"]:
+                            state["status"] = "Auth failed"
+                            return
+                        
+                        # Update text and characteristic value for reads
+                        new_text = payload[text_key]
+                        state["text"] = new_text
+                        save_text(new_text)
+                        
+                        # Update the characteristic value so clients can read the new text
+                        text_characteristic.write(new_text.encode('utf-8'), send_update=False)
+                        
+                        state["status"] = "Updated!"
+                        
+                        # Clear the characteristic value for next write
+                        text_characteristic.write(b"")
                     
-                    # Update characteristic for reads
-                    text_characteristic.write(data)
+                    except Exception as e:
+                        state["status"] = "Parse error"
+                        state["error_text"] = f"Error: {str(e)}, Data: {data[:50]}"
+                        state["error_time"] = io.ticks
                     
             except asyncio.TimeoutError:
-                # No write received, continue
+                # Timeout waiting for new data - keep listening
                 pass
             except Exception as e:
-                print(f"Write error: {e}")
-                state["connection_status"] = "Write error"
+                state["status"] = "Write error"
+                state["error_text"] = f"BLE Error: {str(e)}"
+                state["error_time"] = io.ticks
                 
-    except Exception as e:
-        print(f"Bluetooth error: {e}")
-        state["connection_status"] = f"BT Error"
-        state["bt_phase"] = "idle"
+    except Exception:
+        state["status"] = "BT Error"
+        state["bt_phase"] = "error"
         state["advertising"] = None
         state["connection"] = None
 
 
 def init():
     """Initialize the app."""
-    global state
+    global state, text_service, text_characteristic
     
     # Load font and enable antialiasing
     screen.font = PixelFont.load("/system/assets/fonts/nope.ppf")
@@ -152,20 +189,40 @@ def init():
     state["text"] = load_text()
     
     if BLUETOOTH_AVAILABLE:
-        # Set initial characteristic value
-        text_characteristic.write(state["text"].encode('utf-8'))
-        state["connection_status"] = "Ready"
-        state["bt_phase"] = "idle"
-        print("Bluetooth initialized")
+        try:
+            # Generate random password (displayed on screen, not transmitted via BLE)
+            state["password"] = generate_password()
+            
+            # Set up GATT Server
+            text_service = aioble.Service(_TEXT_SERVICE_UUID)
+            text_characteristic = aioble.Characteristic(
+                text_service, _TEXT_CHAR_UUID, write=True, read=True
+            )
+            
+            aioble.register_services(text_service)
+            
+            # Set initial characteristic value
+            text_characteristic.write(state["text"].encode('utf-8'))
+            
+            state["status"] = "Ready"
+            state["bt_phase"] = "idle"
+        except Exception:
+            state["status"] = "Init failed"
+            state["bt_phase"] = "error"
     else:
-        state["connection_status"] = "BT unavailable"
+        state["status"] = "BT unavailable"
 
 
 def update():
     """Main update loop called every frame."""
     # Handle Bluetooth (this may block during connection/write operations)
-    if BLUETOOTH_AVAILABLE:
+    # Only call if not in error state
+    if BLUETOOTH_AVAILABLE and state["bt_phase"] != "error":
         handle_bluetooth()
+    
+    # Clear error text after 3 seconds
+    if state["error_text"] and (io.ticks - state["error_time"]) > 3000:
+        state["error_text"] = None
     
     # Clear screen with dark blue background
     screen.brush = brushes.color(0, 20, 40)
@@ -177,18 +234,19 @@ def update():
     
     # Draw status text
     screen.brush = brushes.color(255, 255, 255)
-    status_text = state["connection_status"][:25]
-    screen.text(status_text, 5, 3)
+    screen.text(state["status"][:25], 5, 3)
     
-    # Draw main text centered
-    screen.brush = brushes.color(255, 255, 255)
-    text_width, _ = screen.measure_text(state["text"])
-    x = max(0, (160 - text_width) // 2)
-    y = 55  # Center vertically
+    # Draw password in top right
+    screen.brush = brushes.color(255, 255, 100)
+    password_text = f"PW: {state.get('password', '----')}"
+    pw_width, _ = screen.measure_text(password_text)
+    screen.text(password_text, 160 - pw_width - 5, 18)
     
-    # Word wrap if text is too long
-    if text_width > 155:
-        words = state["text"].split()
+    # Draw error message if present, otherwise draw main text
+    if state["error_text"]:
+        screen.brush = brushes.color(255, 100, 100)
+        # Word wrap error text
+        words = state["error_text"].split()
         lines = []
         current_line = ""
         
@@ -205,14 +263,46 @@ def update():
         if current_line:
             lines.append(current_line)
         
-        # Draw wrapped lines
+        # Draw error lines
         start_y = 55 - ((len(lines) - 1) * 8)
         for i, line in enumerate(lines):
             line_width, _ = screen.measure_text(line)
             line_x = max(0, (160 - line_width) // 2)
             screen.text(line, line_x, start_y + i * 16)
     else:
-        screen.text(state["text"], x, y)
+        # Draw main text centered
+        screen.brush = brushes.color(255, 255, 255)
+        text_width, _ = screen.measure_text(state["text"])
+        x = max(0, (160 - text_width) // 2)
+        y = 55  # Center vertically
+        
+        # Word wrap if text is too long
+        if text_width > 155:
+            words = state["text"].split()
+            lines = []
+            current_line = ""
+            
+            for word in words:
+                test_line = current_line + (" " if current_line else "") + word
+                test_width, _ = screen.measure_text(test_line)
+                if test_width > 155:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+                else:
+                    current_line = test_line
+            
+            if current_line:
+                lines.append(current_line)
+            
+            # Draw wrapped lines
+            start_y = 55 - ((len(lines) - 1) * 8)
+            for i, line in enumerate(lines):
+                line_width, _ = screen.measure_text(line)
+                line_x = max(0, (160 - line_width) // 2)
+                screen.text(line, line_x, start_y + i * 16)
+        else:
+            screen.text(state["text"], x, y)
     
     # Draw instructions at bottom
     screen.brush = brushes.color(150, 150, 150)
@@ -223,12 +313,10 @@ def update():
 
 def on_exit():
     """Cleanup on exit."""
-    if BLUETOOTH_AVAILABLE:
+    if BLUETOOTH_AVAILABLE and state.get("connection"):
         try:
-            # Disconnect if connected
-            if state.get("connection"):
-                asyncio.run(state["connection"].disconnect())
-        except:
+            asyncio.run(state["connection"].disconnect())
+        except Exception:
             pass
 
 

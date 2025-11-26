@@ -32,15 +32,27 @@ The app uses a simple state machine in the `update()` loop:
 - Write: Yes
 - Notify: No
 
+**Password Authentication:**
+The badge generates a random 4-character alphanumeric password on boot. This password must be included with all text write operations. The password is **only displayed on the badge screen** and is **NOT transmitted via Bluetooth**. Users must have physical access to the badge to read the password.
+
+**Password Format:**
+- Exactly 4 alphanumeric characters (e.g., "A7K2", "Q3M9")
+- Generated randomly on badge boot/reset
+- **Only visible on badge screen** - not available via Bluetooth characteristic
+- Proves physical possession of the badge
+- Prevents casual trolling at conferences, not designed for strong security
+
 ## Connection Process
 
-1. **Discovery**: Scan for BLE devices advertising the name `"badge2-text"`
+1. **Obtain Password**: Read the 4-character password from the badge screen (physical access required)
 
-2. **Connect**: Establish a connection to the device
+2. **Discovery**: Scan for BLE devices advertising the name `"badge2-text"`
 
-3. **Service Discovery**: Discover the text service using UUID `12345678-1234-5678-1234-56789abcdef0`
+3. **Connect**: Establish a connection to the device
 
-4. **Characteristic Discovery**: Find the text characteristic using UUID `12345678-1234-5678-1234-56789abcdef1`
+4. **Service Discovery**: Discover the text service using UUID `12345678-1234-5678-1234-56789abcdef0`
+
+5. **Characteristic Discovery**: Find the text characteristic using UUID `12345678-1234-5678-1234-56789abcdef1`
 
 ## Reading Current Text
 
@@ -55,16 +67,31 @@ print(f"Current text: {current_text}")
 
 ## Writing New Text
 
-To update the displayed text:
+All text writes must include the 4-character password that is displayed on the badge screen:
 
 ```python
-# Encode your new text as UTF-8 bytes
-new_text = "Hello from my device!"
-data = new_text.encode('utf-8')
+import json
 
-# Write to the characteristic
+# Password must be obtained by reading the badge screen
+# It is NOT available via Bluetooth - this proves physical possession
+badge_password = "A7K2"  # Example - read this from the badge screen
+
+# Prepare authenticated payload
+payload = {
+    "password": badge_password,
+    "text": "Hello from my device!"
+}
+
+# Encode as JSON and write
+data = json.dumps(payload).encode('utf-8')
 await text_characteristic.write(data)
 ```
+
+**Authentication Rules:**
+- All writes must be JSON with `password` and `text` fields
+- Password is compared as plain text (case-sensitive)
+- If password doesn't match, write is rejected silently
+- No attempt limiting - incorrect password just fails the write
 
 **Text Constraints:**
 - Encoding: UTF-8
@@ -72,19 +99,37 @@ await text_characteristic.write(data)
 - Longer text will be word-wrapped automatically
 - No strict limit, but very long text may be truncated or difficult to read
 
+**BLE Packet Fragmentation:**
+The badge automatically handles BLE write fragmentation (MTU limitations). The characteristic uses `capture=True` which means:
+- **Single writes only** - Each JSON payload should be sent as a single `write()` call
+- **Automatic chunking** - The BLE stack automatically fragments large writes into MTU-sized packets
+- **Transparent buffering** - The badge buffers incoming fragments and parses when complete JSON is received
+- **Status feedback** - Badge displays `"Buffering (Xb)..."` while accumulating fragments
+- **No manual chunking needed** - Clients should NOT manually split the JSON payload
+- **Max payload size** - 512 bytes (enforced buffer limit for safety)
+
+Most BLE stacks handle this transparently - just write the full JSON payload in one call and the stack will handle packet-level fragmentation based on the negotiated MTU.
+
 ## Example Client Code (Python with aioble)
 
 ```python
 import asyncio
 import aioble
 import bluetooth
+import json
 
 # Service and characteristic UUIDs
 TEXT_SERVICE_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef0")
 TEXT_CHAR_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef1")
+PASSWORD_CHAR_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef2")
 
-async def update_badge_text(new_text):
-    """Connect to badge and update text."""
+async def update_badge_text(new_text, password):
+    """Connect to badge and update text with authentication.
+    
+    Args:
+        new_text: The text to display on the badge
+        password: 4-character password read from the badge screen
+    """
     
     # Scan for the badge
     print("Scanning for badge2-text...")
@@ -102,16 +147,22 @@ async def update_badge_text(new_text):
                     service = await connection.service(TEXT_SERVICE_UUID)
                     
                     # Get the text characteristic
-                    char = await service.characteristic(TEXT_CHAR_UUID)
+                    text_char = await service.characteristic(TEXT_CHAR_UUID)
                     
                     # Read current text
-                    current_data = await char.read()
+                    current_data = await text_char.read()
                     current_text = current_data.decode('utf-8')
                     print(f"Current text: {current_text}")
                     
+                    # Prepare authenticated write with user-provided password
+                    payload = {
+                        "password": password,
+                        "text": new_text
+                    }
+                    new_data = json.dumps(payload).encode('utf-8')
+                    
                     # Write new text
-                    new_data = new_text.encode('utf-8')
-                    await char.write(new_data)
+                    await text_char.write(new_data)
                     print(f"Updated text to: {new_text}")
                     
                     # Disconnect
@@ -125,14 +176,15 @@ async def update_badge_text(new_text):
     print("Badge not found")
     return False
 
-# Usage
-asyncio.run(update_badge_text("Hello Universe 2025!"))
+# Usage - password must be read from badge screen
+badge_password = input("Enter 4-character password from badge screen: ")
+asyncio.run(update_badge_text("Hello Universe 2025!", password=badge_password))
 ```
 
 ## Example Client Code (Web Bluetooth API)
 
 ```javascript
-async function updateBadgeText(newText) {
+async function updateBadgeText(newText, password) {
     try {
         // Request device
         const device = await navigator.bluetooth.requestDevice({
@@ -149,20 +201,27 @@ async function updateBadgeText(newText) {
             '12345678-1234-5678-1234-56789abcdef0'
         );
         
-        // Get characteristic
-        const characteristic = await service.getCharacteristic(
+        // Get text characteristic
+        const textCharacteristic = await service.getCharacteristic(
             '12345678-1234-5678-1234-56789abcdef1'
         );
         
         // Read current text
-        const currentValue = await characteristic.readValue();
+        const currentValue = await textCharacteristic.readValue();
         const currentText = new TextDecoder().decode(currentValue);
         console.log('Current text:', currentText);
         
-        // Write new text
+        // Prepare authenticated write with user-provided password
+        const payload = {
+            password: password,
+            text: newText
+        };
         const encoder = new TextEncoder();
-        const data = encoder.encode(newText);
-        await characteristic.writeValue(data);
+        const data = encoder.encode(JSON.stringify(payload));
+        
+        // Write new text in a single call
+        // Use writeValueWithResponse for reliability - the BLE stack will handle fragmentation
+        await textCharacteristic.writeValueWithResponse(data);
         console.log('Text updated to:', newText);
         
         // Disconnect
@@ -173,9 +232,42 @@ async function updateBadgeText(newText) {
     }
 }
 
-// Usage
-updateBadgeText("Hello from the web!");
+// Usage - password must be provided (from QR code URL param or user input)
+const urlParams = new URLSearchParams(window.location.search);
+const password = urlParams.get('password') || prompt('Enter badge password:');
+updateBadgeText("Hello from the web!", password);
 ```
+
+## QR Code Integration
+
+The badge displays its 4-character password on screen along with a QR code:
+
+```
+https://yourdomain.com/badge-plus-plus?password=A7K2
+```
+
+**QR Code Workflow:**
+1. Badge generates random 4-character password on boot (e.g., "A7K2")
+2. Badge displays password and QR code on screen (password is NOT transmitted via Bluetooth)
+3. User scans QR code with phone (password embedded in URL)
+4. Browser opens Badge++ page with password pre-filled in URL parameter
+5. User clicks "Connect Badge" button (required by Web Bluetooth security)
+6. Client connects via Bluetooth and sends password in write payload
+7. Badge validates password matches screen display before accepting text update
+8. Password persists until badge is power-cycled/reset
+
+**URL Parameter Format:**
+```
+/badge-plus-plus?password=A7K2
+```
+
+**Benefits:**
+- Simple 4-character password easy to read and type manually if needed
+- QR code eliminates manual entry
+- **Physical access to badge screen required** - password never transmitted via Bluetooth
+- Proves user has physical possession of the badge
+- Prevents casual conference trolling without complex security
+- Password visible on badge so owner can share access intentionally
 
 ## Status Display
 
@@ -187,26 +279,39 @@ The badge displays connection status at the top of the screen:
 - **"Waiting for conn..."**: Blocking, waiting for a device to connect
 - **"Connected!"**: Client successfully connected
 - **"Listening..."**: Waiting for data writes (2 second timeout loop)
+- **"Buffering (Xb)..."**: Receiving fragmented BLE packets (X = bytes buffered so far)
 - **"Updated!"**: New text was successfully received and saved
+- **"Auth failed"**: Write rejected due to incorrect password
+- **"Bad format"**: JSON missing required fields (password/text)
+- **"Bad payload"**: JSON parsing or structure error
+- **"Buffer overflow"**: Write exceeded 512 byte safety limit
 - **"Disconnected"**: Client disconnected, will restart advertising
 - **"Write error"**: Error receiving data from client
 - **"BT Error"**: Bluetooth error occurred, will retry from idle state
 
+**Password Display:**
+- 4-character password displayed prominently on screen
+- QR code shown for quick mobile access
+
 ## Persistence
 
 - Text is automatically saved to `/badge2_text.json` on the device
-- The saved text is loaded when the app starts
+- Text is loaded when the app starts
 - Default text: "The quick brown fox jumps"
+- Password is regenerated on each boot (not persisted, not transmitted via Bluetooth)
 
 ## Limitations & Notes
 
 1. **Single Connection**: The badge accepts one connection at a time
-2. **No Authentication**: No pairing or encryption required (for simplicity)
+2. **Simple Authentication**: 4-character password prevents casual trolling, not designed for strong security
 3. **Text Encoding**: Must be valid UTF-8
 4. **Display Wrapping**: Text longer than screen width is automatically word-wrapped
 5. **Blocking Operations**: Display updates pause during connection establishment and data transfers
 6. **Write Timeout**: 2 second timeout when listening for writes (to keep display responsive)
 7. **Auto-Reconnect**: Automatically returns to advertising after disconnection
+8. **Password on Boot**: New password generated each time badge boots/resets
+9. **Physical Access Required**: Password only visible on badge screen, not transmitted via Bluetooth
+10. **JSON Payload**: All writes must use JSON format with password and text fields
 
 ## Troubleshooting
 
@@ -229,7 +334,25 @@ The badge displays connection status at the top of the screen:
 - Ensure data is properly UTF-8 encoded
 - Check that the connection is still active
 - Verify you're writing to the correct characteristic UUID
+- If password is set, ensure JSON payload includes correct password
+- Check status for "Auth failed" message indicating wrong password
 - Some platforms require pairing even though the badge doesn't enforce it
+- Keep payload under 512 bytes (status shows "Buffer overflow" if exceeded)
+- Send entire JSON payload in a single `write()` call (don't manually chunk)
+
+**Badge shows "Buffering (Xb)..." for extended period:**
+- Normal behavior for larger payloads being fragmented by BLE stack
+- Typical MTU is 20-23 bytes, so a 36-byte JSON takes 2-3 packets
+- If stuck buffering, the last packet may have been lost - disconnect and retry
+- Check for valid JSON format - incomplete JSON will continue buffering
+
+**Authentication errors:**
+- Badge shows "Auth failed" when password is incorrect
+- Write silently fails with wrong password (no disconnect)
+- Password must be read from badge screen - it is NOT available via Bluetooth
+- Ensure JSON payload format is correct: `{"password": "A7K2", "text": "Hello"}`
+- Password is case-sensitive
+- Scan QR code or manually type password displayed on badge screen
 
 **Text not persisting:**
 - Check that the device has sufficient storage space
@@ -255,13 +378,21 @@ All async operations are executed synchronously using `asyncio.run()`:
 - `asyncio.run(asyncio.wait_for(text_characteristic.written(), timeout=2.0))` - Blocks up to 2 seconds waiting for writes
 
 **Connection Flow:**
-1. `init()` sets up GATT service and initializes state to `idle`
-2. `update()` calls `handle_bluetooth()` every frame
-3. On `idle`: Starts advertising via `aioble.advertise()`
-4. On `advertising`: Blocks waiting for connection (display pauses)
-5. On `connected`: Polls for writes with 2-second timeout, then continues
-6. On write: Decodes data, updates state, saves to file, updates characteristic
-7. On disconnect/error: Returns to `idle` and restarts
+1. `init()` generates random 4-character password, sets up GATT service with text characteristic only
+2. Displays password and QR code on screen (password NOT exposed via Bluetooth)
+3. `update()` calls `handle_bluetooth()` every frame
+4. On `idle`: Starts advertising via `aioble.advertise()`
+5. On `advertising`: Blocks waiting for connection (display pauses)
+6. On `connected`: Polls for writes with 2-second timeout, then continues
+7. On write: 
+   - Accumulates data in write buffer (handles BLE packet fragmentation)
+   - Attempts to parse buffer as JSON after each fragment
+   - If incomplete JSON: continues buffering, shows "Buffering (Xb)..." status
+   - If complete JSON: validates password field matches screen-displayed password
+   - If valid: extracts text, updates display, saves to file, clears buffer
+   - If invalid: shows "Auth failed" status, clears buffer, continues listening
+   - Safety: clears buffer if it exceeds 512 bytes
+8. On disconnect/error: Returns to `idle` and restarts
 
 **Performance Considerations:**
 - Display updates pause during connection establishment (typically < 1 second)
@@ -271,13 +402,40 @@ All async operations are executed synchronously using `asyncio.run()`:
 
 ## Security Considerations
 
-This implementation prioritizes simplicity over security:
+**Authentication Model:**
+- Simple 4-character password prevents casual conference trolling
+- Password generated randomly on boot, not user-settable
+- **Password ONLY visible on badge screen** - NOT transmitted via Bluetooth
+- Plain text passwords sent in JSON payload from client to badge
+- Requires physical access to badge to read password
+- No attempt limiting or brute force protection
 
-- No authentication required
-- No encryption enforced
-- Any nearby device can modify the text
-- For production use, consider implementing:
-  - Pairing/bonding
-  - PIN/password protection
-  - Encryption
-  - Access control lists
+**Threat Model:**
+- **Target**: Prevent random conference attendees from trolling badge displays without physical access
+- **Casual Tampering**: ✓✓ Mitigated - requires physical access to read password from screen
+- **Remote Attacker**: ✓ Mitigated - cannot obtain password without seeing badge screen
+- **Determined Attacker with Physical Access**: ✗ Not mitigated - password visible on screen
+- **BLE Sniffing**: ⚠️ Partially mitigated - password sent in payload, but only after physical access
+- **Brute Force**: ✗ Not mitigated - no attempt limiting (could try all 456,976 combos in ~1 hour if connected)
+
+**Intended Use:**
+- Conference badges where casual trolling prevention is desired
+- Proof of physical possession model (like Bluetooth pairing)
+- Fun personal projects where security isn't critical
+- Demonstrations where physical access control exists
+- **Not suitable for**: Sensitive data, financial info, authentication tokens
+
+**Design Philosophy:**
+- Physical access proves authorization (like unlocking a phone to pair Bluetooth)
+- Simplicity over strong security
+- Easy to share access (show screen, scan QR, or read 4 chars)
+- No lockout risk (password resets on boot)
+- Transparent operation (password always visible to badge owner)
+
+**QR Code Security:**
+- Password embedded in URL visible to anyone who sees QR code or screen
+- **Scanning QR code proves physical access to badge**
+- Physical security of badge controls access
+- Anyone with camera access to badge can gain control
+- Password never transmitted over Bluetooth - only in QR code and on screen
+- Acceptable for conference/demo use cases
