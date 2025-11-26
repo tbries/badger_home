@@ -110,13 +110,16 @@ def handle_bluetooth():
                 state["connection"] = None
                 state["advertising"] = None
                 state["bt_phase"] = "idle"
+                # Clear buffer on disconnect
+                if "write_buffer" in state:
+                    del state["write_buffer"]
                 return
             
-            # Check if we have buffered data from previous fragments
-            if "write_buffer" in state and len(state["write_buffer"]) > 0:
-                state["status"] = f"Buffering ({len(state['write_buffer'])}b)..."
-            else:
-                state["status"] = "Listening..."
+            # Initialize buffer if needed
+            if "write_buffer" not in state:
+                state["write_buffer"] = b""
+            
+            state["status"] = "Listening..."
             
             try:
                 # Wait for write event (returns connection only, not data)
@@ -124,14 +127,22 @@ def handle_bluetooth():
                     asyncio.wait_for(text_characteristic.written(), timeout=2.0)
                 )
                 
-                # Read the complete characteristic value (BLE stack handles reassembly)
-                data = text_characteristic.read()
+                # Read this fragment from characteristic
+                fragment = text_characteristic.read()
                 
-                if data:
+                if fragment:
+                    # Append to buffer
+                    state["write_buffer"] += fragment
+                    
+                    # Try to parse complete JSON
                     try:
-                        payload = json.loads(data.decode('utf-8'))
-                        password_key = "p"
-                        text_key = "t"
+                        payload = json.loads(state["write_buffer"].decode('utf-8'))
+                        
+                        # Success! Clear buffer and process
+                        state["write_buffer"] = b""
+                        
+                        password_key = "password"
+                        text_key = "text"
                         
                         # Validate payload structure and password
                         if password_key not in payload or text_key not in payload:
@@ -153,22 +164,28 @@ def handle_bluetooth():
                         text_characteristic.write(new_text.encode('utf-8'), send_update=False)
                         
                         state["status"] = "Updated!"
-                        
-                        # Clear the characteristic value for next write
-                        text_characteristic.write(b"")
                     
-                    except Exception as e:
-                        state["status"] = "Parse error"
-                        state["error_text"] = f"Error: {str(e)}, Data: {data[:50]}"
-                        state["error_time"] = io.ticks
+                    except (ValueError, KeyError) as e:
+                        # Incomplete JSON - keep buffering, will try again on next fragment
+                        # Status already updated above with buffer size
+                        
+                        # Safety: prevent buffer overflow
+                        if len(state["write_buffer"]) > 512:
+                            state["status"] = "Buffer overflow"
+                            state["error_text"] = f"Exceeded 512 bytes: {state['write_buffer'][:50]}"
+                            state["error_time"] = io.ticks
+                            state["write_buffer"] = b""
                     
             except asyncio.TimeoutError:
-                # Timeout waiting for new data - keep listening
+                # Timeout - clear any incomplete data to prevent stale buffer
+                if len(state["write_buffer"]) > 0:
+                    state["write_buffer"] = b""
                 pass
             except Exception as e:
                 state["status"] = "Write error"
                 state["error_text"] = f"BLE Error: {str(e)}"
                 state["error_time"] = io.ticks
+                state["write_buffer"] = b""
                 
     except Exception:
         state["status"] = "BT Error"
